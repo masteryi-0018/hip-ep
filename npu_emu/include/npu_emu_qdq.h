@@ -5,7 +5,8 @@
  * npu_emu entry points for the AIE4 quantized-domain selection / movement
  * wrappers (qdq group): elementwise abs / neg / clip / equal / greater / max,
  * where, broadcast min, reduce max / min, max pooling, concat, gather,
- * nearest grid sample and nearest resize. Conventions as in npu_emu.h.
+ * nearest grid sample and nearest resize, and the data-movement kernels with
+ * a fused requantization. Conventions as in npu_emu.h.
  *
  * Requantization. Most kernels requantize their integer result with one
  * accfloat MAC and a float -> integer conversion:
@@ -359,6 +360,48 @@ int npu_qdq_resize_nearest(void* stream, const void* in, npu_dtype dtype,
                            int64_t Ho, int64_t Wo, const int32_t* src_y,
                            const int32_t* src_x, int requantize, float scale,
                            float offset);
+
+/* ---- H. data movement with fused requantization ------------------------ */
+
+/* qdq_<op>_requantize_fused: generic_<op> of npu_emu_movement.h (same
+ * arguments, same logical tensors), then dqq<T, T> in place over the moved
+ * elements:
+ *   out = sat(rne(mac(v, c1, c0)))
+ * with c1 = s_in / s_out (coeff word 0) and c0 = zp_out - c1 * zp_in
+ * (word 1), both computed in double by the YAML and stored as fp32 - the
+ * kernel reads the YAML's words, not ones the python model computes. Input
+ * and output share dtype. dtype: I8 / U8 / I16 / U16, except
+ * slice_16b_inner(_range) (I8 / I16) and slice_16b_c6463 (I16 / U16). */
+int npu_qdq_reshape_innermost_requantize_fused(void* stream, const void* in,
+                                               void* out, npu_dtype dtype,
+                                               int64_t n, float c1, float c0);
+int npu_qdq_slice_innermost_requantize_fused(void* stream, const void* in,
+                                             void* out, npu_dtype dtype,
+                                             int64_t rows, int64_t c,
+                                             int64_t start, int64_t end,
+                                             int64_t stride, float c1,
+                                             float c0);
+int npu_qdq_slice_16b_inner_range_requantize_fused(
+    void* stream, const void* in, void* out, npu_dtype dtype, int64_t rows,
+    int64_t c, int64_t start, int64_t end, float c1, float c0);
+int npu_qdq_slice_16b_inner_requantize_fused(void* stream, const void* in,
+                                             void* out0, void* out1,
+                                             npu_dtype dtype, int64_t rows,
+                                             int64_t c, int64_t split,
+                                             float c1, float c0);
+int npu_qdq_slice_16b_c6463_requantize_fused(void* stream, const void* in,
+                                             void* out0, void* out1,
+                                             npu_dtype dtype, int64_t rows,
+                                             float c1, float c0);
+int npu_qdq_transpose_k8n8_requantize_fused(void* stream, const void* in,
+                                            void* out, npu_dtype dtype,
+                                            int64_t K, int64_t N, float c1,
+                                            float c0);
+int npu_qdq_transpose_unaligned_requantize_fused(void* stream, const void* in,
+                                                 void* out, npu_dtype dtype,
+                                                 const int64_t* shape,
+                                                 const int* perm, float c1,
+                                                 float c0);
 
 #ifdef __cplusplus
 }

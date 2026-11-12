@@ -411,6 +411,14 @@ int gridsample_impl(void* stream, const void* in, npu_dtype dt, const void* grid
   return launch(stream, Ho * Wo * C, gridsample_nearest_kernel, in, dt, grid, gt, out, g);
 }
 
+// The fused wrappers run dqq<T, T> in place on the moved output; on the same
+// stream the requantization sees the finished movement.
+int requant_inplace(int rc, void* stream, void* p, npu_dtype t, int64_t n, float c1,
+                    float c0) {
+  if (rc) return rc;
+  return launch(stream, n, affine_kernel, static_cast<const void*>(p), t, p, t, c1, c0);
+}
+
 }  // namespace
 
 extern "C" {
@@ -695,6 +703,64 @@ int npu_qdq_resize_nearest(void* stream, const void* in, npu_dtype dtype, void* 
   if (!(is8(dtype) || is16(dtype)) || H <= 0 || W <= 0 || C <= 0) return -1;
   return launch(stream, Ho * Wo * C, resize_nearest_kernel, in, dtype, out, W, C, Wo, src_y,
                 src_x, requantize, scale, offset);
+}
+
+// ---- H ------------------------------------------------------------------------
+
+int npu_qdq_reshape_innermost_requantize_fused(void* stream, const void* in, void* out,
+                                               npu_dtype dtype, int64_t n, float c1, float c0) {
+  if (!(is8(dtype) || is16(dtype))) return -1;
+  return requant_inplace(npu_generic_reshape_innermost(stream, in, out, dtype, n), stream, out,
+                         dtype, n, c1, c0);
+}
+int npu_qdq_slice_innermost_requantize_fused(void* stream, const void* in, void* out,
+                                             npu_dtype dtype, int64_t rows, int64_t c,
+                                             int64_t start, int64_t end, int64_t stride,
+                                             float c1, float c0) {
+  if (!(is8(dtype) || is16(dtype))) return -1;
+  const int rc =
+      npu_generic_slice_innermost(stream, in, out, dtype, rows, c, start, end, stride);
+  const int64_t w = end > start && stride > 0 ? (end - start + stride - 1) / stride : 0;
+  return requant_inplace(rc, stream, out, dtype, rows * w, c1, c0);
+}
+int npu_qdq_slice_16b_inner_range_requantize_fused(void* stream, const void* in, void* out,
+                                                   npu_dtype dtype, int64_t rows, int64_t c,
+                                                   int64_t start, int64_t end, float c1,
+                                                   float c0) {
+  if (dtype != NPU_I8 && dtype != NPU_I16) return -1;
+  const int rc = npu_generic_slice_16b_inner_range(stream, in, out, dtype, rows, c, start, end);
+  return requant_inplace(rc, stream, out, dtype, end > start ? rows * (end - start) : 0, c1, c0);
+}
+int npu_qdq_slice_16b_inner_requantize_fused(void* stream, const void* in, void* out0,
+                                             void* out1, npu_dtype dtype, int64_t rows,
+                                             int64_t c, int64_t split, float c1, float c0) {
+  if (dtype != NPU_I8 && dtype != NPU_I16) return -1;
+  int rc = npu_generic_slice_16b_inner(stream, in, out0, out1, dtype, rows, c, split);
+  rc = requant_inplace(rc, stream, out0, dtype, rows * split, c1, c0);
+  return requant_inplace(rc, stream, out1, dtype, rows * (c - split), c1, c0);
+}
+int npu_qdq_slice_16b_c6463_requantize_fused(void* stream, const void* in, void* out0,
+                                             void* out1, npu_dtype dtype, int64_t rows,
+                                             float c1, float c0) {
+  if (!is16(dtype)) return -1;
+  int rc = npu_generic_slice_16b_c6463(stream, in, out0, out1, dtype, rows);
+  rc = requant_inplace(rc, stream, out0, dtype, rows * 63, c1, c0);
+  return requant_inplace(rc, stream, out1, dtype, rows, c1, c0);
+}
+int npu_qdq_transpose_k8n8_requantize_fused(void* stream, const void* in, void* out,
+                                            npu_dtype dtype, int64_t K, int64_t N, float c1,
+                                            float c0) {
+  if (!(is8(dtype) || is16(dtype))) return -1;
+  return requant_inplace(npu_generic_transpose_k8n8(stream, in, out, dtype, K, N), stream, out,
+                         dtype, K * N, c1, c0);
+}
+int npu_qdq_transpose_unaligned_requantize_fused(void* stream, const void* in, void* out,
+                                                 npu_dtype dtype, const int64_t* shape,
+                                                 const int* perm, float c1, float c0) {
+  if (!(is8(dtype) || is16(dtype)) || !shape) return -1;
+  const int rc = npu_generic_transpose_unaligned(stream, in, out, dtype, shape, perm);
+  return requant_inplace(rc, stream, out, dtype, shape[0] * shape[1] * shape[2] * shape[3], c1,
+                         c0);
 }
 
 }  // extern "C"

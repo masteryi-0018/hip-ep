@@ -60,7 +60,7 @@ covers as unverified.
 |---|---|---|
 | [npu_emu_movement.h](include/npu_emu_movement.h) | concat, slice, copy, pad, transpose, depth/space, expand, gather, nearest resize, not | element bits copied (NaN payloads, -0, fp8 NaN pass through); `concat_unaligned_bfp16` re-encodes blocks that straddle the inputs (half to even); gather indices are read as uint32 and an out-of-range index leaves its output unwritten |
 | [npu_emu_select.h](include/npu_emu_select.h) | abs/neg/clip, 3D-broadcast compare and min/max, arg max/min, reduce max/min, max pool, top-k (bf16 / f16 / fp8 / integer) | bf16 VMAX/VMIN order -0 below +0; fp8 kernels compute in fp32 (zero results are +0) and re-encode; arg max / top-k keep the first index of a tie and wrap indices modulo 2^8 or 2^16 |
-| [npu_emu_qdq.h](include/npu_emu_qdq.h) | quantized abs/neg/clip/equal/greater/max/min/where, reduce max/min, max pool, concat, gather, nearest grid sample / resize | `sat(round(fma(x, scale, offset) * 2^shift))` with the coefficient words of `coeff32.txt`; round is half to even except `qdq_resize_nearest` (toward zero) |
+| [npu_emu_qdq.h](include/npu_emu_qdq.h) | quantized abs/neg/clip/equal/greater/max/min/where, reduce max/min, max pool, concat, gather, nearest grid sample / resize; reshape / slice / transpose with a fused requantization (`*_requantize_fused`) | `sat(round(fma(x, scale, offset) * 2^shift))` with the coefficient words of `coeff32.txt`; round is half to even except `qdq_resize_nearest` (toward zero) |
 
 ## Build and test
 

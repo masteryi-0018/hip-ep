@@ -16,8 +16,9 @@ import pytest
 
 from aiesim_common import cases, data, words
 from npu import I64, NPU_I8, NPU_I16, NPU_U8, NPU_U16, OUT
-from npu import DevList, Host, U32
+from npu import DevList, Host, Out, U32
 from npu import call as callx
+from npu import callx as callx_n
 from test_golden_qdq import GridQdq
 
 INT = {"int8": (NPU_I8, np.int8), "uint8": (NPU_U8, np.uint8),
@@ -329,9 +330,149 @@ def run_resize(case, t):
     return got, want
 
 
+# ---- H: data movement with fused requantization -------------------------------
+# The inputs and graded regions are those of the generic_* movement wrappers
+# (test_aiesim_movement.py); c1 / c0 are coeff32.txt words 0 and 1.
+
+def fused_dtype(t):
+    return INT[t.get("ifm_dtype", t.get("dtype"))]
+
+
+def run_fused_reshape(case, t):
+    tt, dt = fused_dtype(t)
+    phys = [t[f"ifm_physical_dim_{i}"] * t[f"ifm_dim_{i}_iter"] for i in range(4)]
+    vin, vout, pout = t["ifm_valid_dim_3"], t["ofm_valid_dim_3"], t["ofm_physical_dim_3"]
+    x = data(case, "ifm32.txt", dt)[:int(np.prod(phys))].reshape(-1, phys[3])[:, :vin]
+    x = np.ascontiguousarray(x).reshape(-1)
+    rows = x.size // vout
+    got = go("npu_qdq_reshape_innermost_requantize_fused", x, OUT, tt, I64(x.size),
+             *coeffs(case, 2), n=x.size, dt=dt)
+    want = data(case, "ofm32.txt", dt)[:rows * pout].reshape(rows, pout)[:, :vout]
+    return got, want
+
+
+def sv_full(t, pre):
+    return [t[f"{pre}_physical_sv_{d}"] * t[f"ifm_{d}_iteration"]
+            for d in ("batch", "height", "width", "channel")]
+
+
+def run_fused_slice_innermost(case, t):
+    tt, dt = fused_dtype(t)
+    dims = ("batch", "height", "width", "channel")
+    phys = sv_full(t, "ifm")
+    valid = [t[f"ifm_valid_sv_{d}"] if t[f"ifm_{d}_iteration"] == 1 else phys[i]
+             for i, d in enumerate(dims)]
+    valid[3] = t["ifm_valid_sv_channel"]
+    x = data(case, "ifm32.txt", dt)[:int(np.prod(phys))].reshape(phys)
+    x = np.ascontiguousarray(x[:valid[0], :valid[1], :valid[2], :valid[3]])
+    rows = valid[0] * valid[1] * valid[2]
+    s, e, st = t["slice_inner_start"], t["slice_inner_end"], t.get("slice_inner_stride", 1)
+    wo = len(range(s, e, st))
+    got = go("npu_qdq_slice_innermost_requantize_fused", x.reshape(rows, valid[3]), OUT, tt,
+             I64(rows), I64(valid[3]), I64(s), I64(e), I64(st), *coeffs(case, 2),
+             n=rows * wo, dt=dt)
+    ophys = [valid[i] + t[f"ofm_physical_sv_{d}"] - t[f"ofm_valid_sv_{d}"]
+             for i, d in enumerate(dims[:3])] + [wo + t["ofm_physical_sv_channel"] -
+                                                 t["ofm_valid_sv_channel"]]
+    want = data(case, "ofm32.txt", dt)[:int(np.prod(ophys))].reshape(ophys)
+    return got, want[:valid[0], :valid[1], :valid[2], :wo]
+
+
+def run_fused_slice_16b_inner_range(case, t):
+    tt, dt = fused_dtype(t)
+    n, h, w, c = sv_full(t, "ifm")
+    rows, cv = n * h * w, t["ifm_valid_sv_channel"]
+    s, e, co = t["slice_inner_start"], t["slice_inner_end"], t["ofm_physical_sv_channel"]
+    x = np.ascontiguousarray(data(case, "ifm32.txt", dt)[:rows * c].reshape(rows, c)[:, :cv])
+    got = go("npu_qdq_slice_16b_inner_range_requantize_fused", x, OUT, tt, I64(rows), I64(cv),
+             I64(s), I64(e), *coeffs(case, 2), n=rows * (e - s), dt=dt)
+    return got, data(case, "ofm32.txt", dt)[:rows * co].reshape(rows, co)[:, :e - s]
+
+
+def run_fused_slice_16b_inner(case, t):
+    tt, dt = fused_dtype(t)
+    n, h, w, c = sv_full(t, "ifm")
+    rows, cv, sp = n * h * w, t["ifm_valid_sv_channel"], t["slice_inner"]
+    p0, p1 = t["ofm0_physical_sv_channel"], t["ofm1_physical_sv_channel"]
+    x = np.ascontiguousarray(data(case, "ifm32.txt", dt)[:rows * c].reshape(rows, c)[:, :cv])
+    es = np.dtype(dt).itemsize
+    o0, o1 = callx_n("npu_qdq_slice_16b_inner_requantize_fused", x, Out(0), Out(1), tt,
+                     I64(rows), I64(cv), I64(sp), *coeffs(case, 2),
+                     outs=[rows * sp * es, rows * (cv - sp) * es])
+    want = data(case, "ofm32.txt", dt)[:rows * (p0 + p1)]
+    got = np.concatenate([o0.view(dt), o1.view(dt)])
+    want = np.concatenate([want[:rows * p0].reshape(rows, p0)[:, :sp].reshape(-1),
+                           want[rows * p0:].reshape(rows, p1)[:, :cv - sp].reshape(-1)])
+    return got, want
+
+
+def run_fused_slice_16b_c6463(case, t):
+    tt, dt = fused_dtype(t)
+    n, h, w, _ = sv_full(t, "ifm")
+    rows = n * h * w
+    x = data(case, "ifm32.txt", dt)[:rows * 64].reshape(rows, 64)
+    es = np.dtype(dt).itemsize
+    o0, o1 = callx_n("npu_qdq_slice_16b_c6463_requantize_fused", x, Out(0), Out(1), tt,
+                     I64(rows), *coeffs(case, 2), outs=[rows * 63 * es, rows * es])
+    return np.concatenate([o0.view(dt), o1.view(dt)]), data(case, "ofm32.txt", dt)[:rows * 64]
+
+
+def run_fused_transpose_k8n8(case, t):
+    tt, dt = fused_dtype(t)
+    K = t["ifm_sv_K_physical"] * t["ifm_K_iteration"]
+    N = t["ifm_sv_N_physical"] * t["ifm_N_iteration"]
+    Kv, Nv = t["ifm_K_full_valid"], t["ifm_N_full_valid"]
+    # (K/8, N/8, 8, 8) tiles; only the valid tiles are graded (tensor_descr.h)
+    tiles = data(case, "ifm32.txt", dt)[:K * N].reshape(K // 8, N // 8, 8, 8)
+    x = np.ascontiguousarray(tiles[:Kv // 8, :Nv // 8].transpose(0, 2, 1, 3)).reshape(Kv, Nv)
+    got = go("npu_qdq_transpose_k8n8_requantize_fused", x, OUT, tt, I64(Kv), I64(Nv),
+             *coeffs(case, 2), n=Kv * Nv, dt=dt)
+    # out tile (kb, nb) holds out[nb*8 + j][kb*8 + i] at [j][i]
+    got = got.reshape(Nv // 8, 8, Kv // 8, 8).transpose(2, 0, 1, 3)
+    want = data(case, "ofm32.txt", dt)[:K * N].reshape(K // 8, N // 8, 8, 8)
+    return np.ascontiguousarray(got), want[:Kv // 8, :Nv // 8]
+
+
+# The wrapper's perm code -> axis order, innermost first (QDQ_TransposeUnaligned...py)
+PERM_CODE = [(3, 2, 1, 0), (3, 2, 0, 1), (3, 1, 2, 0), (3, 1, 0, 2), (3, 0, 2, 1), (3, 0, 1, 2),
+             (2, 3, 1, 0), (2, 3, 0, 1), (2, 1, 3, 0), (2, 1, 0, 3), (2, 0, 3, 1), (2, 0, 1, 3),
+             (1, 3, 2, 0), (1, 3, 0, 2), (1, 2, 3, 0), (1, 2, 0, 3), (1, 0, 3, 2), (1, 0, 2, 3),
+             (0, 3, 2, 1), (0, 3, 1, 2), (0, 2, 3, 1), (0, 2, 1, 3), (0, 1, 3, 2), (0, 1, 2, 3)]
+
+
+def run_fused_transpose_unaligned(case, t):
+    tt, dt = fused_dtype(t)
+    axes = ("outer", "mid_o", "mid_i", "inner")
+    start = [t[f"Di_{a}_start"] for a in axes]
+    full = [t[f"Di_{a}_iter"] * t[f"Di_{a}_sv_physical"] for a in axes]
+    valid = [t[f"Di_{a}_full_valid"] for a in axes]
+    perm = PERM_CODE[t["perm"]][::-1]
+    phys = [s + f for s, f in zip(start, full)]
+    x = data(case, "ifm32.txt", dt)[:int(np.prod(phys))].reshape(phys)
+    x = np.ascontiguousarray(x[tuple(slice(s, s + v) for s, v in zip(start, valid))])
+    got = go("npu_qdq_transpose_unaligned_requantize_fused", x, OUT, tt,
+             Host(np.array(valid, np.int64)), Host(np.array(perm, np.int32)), *coeffs(case, 2),
+             n=x.size, dt=dt)
+    # output axis k comes from input axis perm[k], with that axis's start and garbage
+    ostart = [start[p] for p in perm]
+    ophys = [start[p] + full[p] for p in perm]
+    want = data(case, "ofm32.txt", dt)[:int(np.prod(ophys))].reshape(ophys)
+    return got, want[tuple(slice(s, s + valid[p]) for s, p in zip(ostart, perm))]
+
+
+FUSED = {"reshape_innermost": run_fused_reshape, "slice_innermost": run_fused_slice_innermost,
+         "slice_16b_inner_range": run_fused_slice_16b_inner_range,
+         "slice_16b_inner": run_fused_slice_16b_inner,
+         "slice_16b_c6463": run_fused_slice_16b_c6463,
+         "transpose_k8n8": run_fused_transpose_k8n8,
+         "transpose_unaligned": run_fused_transpose_unaligned}
+
+
 def runner(d):
     """Regression dir name -> runner(case, testcase)."""
     w = d.removesuffix("_wrapper")
+    if w.endswith("_requantize_fused"):
+        return FUSED[w.removeprefix("qdq_").removesuffix("_requantize_fused")]
     bits = 16 if "a16" in w and "a16a8" not in w else 8
     for op in ("abs", "neg", "clip"):
         if w.startswith(f"qdq_elementwise_{op}_"):
@@ -380,7 +521,8 @@ DIRS = [f"qdq_elementwise_{op}_a{b}_wrapper" for op in
        [f"qdq_gather_element_2din_2dindices_axis0_{s}_wrapper" for s in
         ("a8a8", "a8a16", "a16a8", "a16a16")] + \
        [f"qdq_gridsample_nearest_{v}_wrapper" for v in ("a8", "a16", "a8w8")] + \
-       [f"qdq_resize_nearest_a{b}_wrapper" for b in (8, 16)]
+       [f"qdq_resize_nearest_a{b}_wrapper" for b in (8, 16)] + \
+       [f"qdq_{op}_requantize_fused_wrapper" for op in FUSED]
 
 CASES = cases(DIRS)
 

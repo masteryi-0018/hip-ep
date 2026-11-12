@@ -344,3 +344,92 @@ def test_qdq_resize_nearest(requantize):
             got = run("npu_qdq_resize_nearest", x, T[t][0], OUT, I64(5), I64(6), I64(70), I64(11),
                       I64(9), sy, sx, requantize, scale, offset, n=11 * 9 * 70, t=t)
             assert_same(got, q.resize_nearest(x, sy, sx, requantize, scale, offset, t))
+
+
+# ---- H ----------------------------------------------------------------------------
+# Data movement then requantization in place; the movement itself is covered by
+# test_golden_movement.py, so the expected result is numpy indexing + q.requant.
+
+FUSED_COEFFS = COEFFS[:6] + [(f(1 / 6), f(64 - 128 / 6))]
+
+
+def fused_types(op):
+    if op in ("slice_16b_inner", "slice_16b_inner_range"):
+        return ["i8", "i16"]
+    return ["i16", "u16"] if op == "slice_16b_c6463" else ["i8", "u8", "i16", "u16"]
+
+
+@pytest.mark.parametrize("t", fused_types("reshape_innermost"))
+def test_qdq_reshape_innermost_requantize_fused(t):
+    x = rnd(t, (1001,))
+    for c1, c0 in FUSED_COEFFS:
+        got = run("npu_qdq_reshape_innermost_requantize_fused", x, OUT, T[t][0], I64(x.size), c1,
+                  c0, n=x.size, t=t)
+        assert_same(got, q.requant(x, c1, c0, t))
+
+
+@pytest.mark.parametrize("t", fused_types("slice_innermost"))
+def test_qdq_slice_innermost_requantize_fused(t):
+    x = rnd(t, (7, 50))
+    for start, end, stride in [(3, 47, 3), (0, 50, 1), (10, 11, 1)]:
+        want = x[:, start:end:stride]
+        for c1, c0 in FUSED_COEFFS:
+            got = run("npu_qdq_slice_innermost_requantize_fused", x, OUT, T[t][0], I64(7), I64(50),
+                      I64(start), I64(end), I64(stride), c1, c0, n=want.size, t=t)
+            assert_same(got, q.requant(want, c1, c0, t))
+
+
+@pytest.mark.parametrize("t", fused_types("slice_16b_inner_range"))
+def test_qdq_slice_16b_inner_range_requantize_fused(t):
+    x = rnd(t, (9, 70))
+    for c1, c0 in FUSED_COEFFS:
+        got = run("npu_qdq_slice_16b_inner_range_requantize_fused", x, OUT, T[t][0], I64(9),
+                  I64(70), I64(5), I64(66), c1, c0, n=9 * 61, t=t)
+        assert_same(got, q.requant(x[:, 5:66], c1, c0, t))
+
+
+def two_outputs(name, x, t, *args, n0, n1):
+    es = np.dtype(T[t][1]).itemsize
+    o0, o1 = npu.callx(name, x, npu.Out(0), npu.Out(1), T[t][0], *args,
+                       outs=[n0 * es, n1 * es])
+    return np.concatenate([o0.view(T[t][1]), o1.view(T[t][1])])
+
+
+@pytest.mark.parametrize("t", fused_types("slice_16b_inner"))
+def test_qdq_slice_16b_inner_requantize_fused(t):
+    x = rnd(t, (9, 70))
+    for c1, c0 in FUSED_COEFFS:
+        got = two_outputs("npu_qdq_slice_16b_inner_requantize_fused", x, t, I64(9), I64(70),
+                          I64(24), c1, c0, n0=9 * 24, n1=9 * 46)
+        want = np.concatenate([x[:, :24].reshape(-1), x[:, 24:].reshape(-1)])
+        assert_same(got, q.requant(want, c1, c0, t))
+
+
+@pytest.mark.parametrize("t", fused_types("slice_16b_c6463"))
+def test_qdq_slice_16b_c6463_requantize_fused(t):
+    x = rnd(t, (11, 64))
+    for c1, c0 in FUSED_COEFFS:
+        got = two_outputs("npu_qdq_slice_16b_c6463_requantize_fused", x, t, I64(11), c1, c0,
+                          n0=11 * 63, n1=11)
+        want = np.concatenate([x[:, :63].reshape(-1), x[:, 63]])
+        assert_same(got, q.requant(want, c1, c0, t))
+
+
+@pytest.mark.parametrize("t", fused_types("transpose_k8n8"))
+def test_qdq_transpose_k8n8_requantize_fused(t):
+    x = rnd(t, (16, 40))
+    for c1, c0 in FUSED_COEFFS:
+        got = run("npu_qdq_transpose_k8n8_requantize_fused", x, OUT, T[t][0], I64(16), I64(40),
+                  c1, c0, n=x.size, t=t)
+        assert_same(got, q.requant(x.T, c1, c0, t))
+
+
+@pytest.mark.parametrize("t", fused_types("transpose_unaligned"))
+def test_qdq_transpose_unaligned_requantize_fused(t):
+    shape, perm = (2, 3, 5, 7), (2, 0, 3, 1)
+    x = rnd(t, shape)
+    for c1, c0 in FUSED_COEFFS:
+        got = run("npu_qdq_transpose_unaligned_requantize_fused", x, OUT, T[t][0],
+                  Host(np.array(shape, np.int64)), Host(np.array(perm, np.int32)), c1, c0,
+                  n=x.size, t=t)
+        assert_same(got, q.requant(np.transpose(x, perm), c1, c0, t))
