@@ -183,4 +183,7 @@ int npu_cast_bfp16toqdqf32(void* stream, const void* in, void* out, int64_t n,
 #include "npu_emu_select.h"
 #include "npu_emu_qdq.h"
 
+/* QDQ integer matrix-multiply / convolution wrappers. */
+#include "npu_emu_matmul.h"
+
 #endif  // NPU_EMU_H_
