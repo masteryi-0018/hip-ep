@@ -9,33 +9,11 @@
 
 #include "npu_emu.h"
 #include "npu_emu_device.h"
+#include "npu_emu_launch.h"
 
 using namespace npu_emu;
 
 namespace {
-
-constexpr int kThreads = 256;
-
-template <typename Kernel, typename... Args>
-int launch(void* stream, int64_t work, Kernel k, Args... args) {
-  if (work <= 0) return 0;
-  (void)hipGetLastError();
-  const int64_t blocks = (work + kThreads - 1) / kThreads;
-  hipLaunchKernelGGL(k, dim3(unsigned(blocks)), dim3(kThreads), 0,
-                     static_cast<hipStream_t>(stream), work, args...);
-  return int(hipGetLastError());
-}
-
-#define NPU_TID                                                  \
-  const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; \
-  if (i >= n) return
-
-bool is_float(npu_dtype t) { return t == NPU_F32 || t == NPU_F16 || t == NPU_BF16; }
-bool is_small_int(npu_dtype t) {
-  return t == NPU_I8 || t == NPU_U8 || t == NPU_I16 || t == NPU_U16;
-}
-bool is_32(npu_dtype t) { return t == NPU_I32 || t == NPU_U32; }
-bool is_64(npu_dtype t) { return t == NPU_I64 || t == NPU_U64; }
 
 // ---- A. format conversion --------------------------------------------------
 
@@ -88,7 +66,7 @@ __global__ void float_to_fp8_kernel(int64_t n, const void* in, npu_dtype it, voi
 __global__ void fp8_to_float_kernel(int64_t n, const void* in, void* out, npu_dtype ot,
                            float scale, Rnd rnd) {
   NPU_TID;
-  const float v = fp8_to_f32(static_cast<const uint8_t*>(in)[i]) * scale;
+  const float v = fp8_to_f32_row(static_cast<const uint8_t*>(in), i, n) * scale;
   store_float(out, ot, i, v, rnd);
 }
 

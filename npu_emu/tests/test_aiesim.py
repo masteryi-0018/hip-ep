@@ -22,44 +22,7 @@ import pytest
 from npu import (I64, OUT, A64Coeff, NPU_BF16, NPU_F16, NPU_F32, NPU_I8, NPU_I16,
                  NPU_I32, NPU_I64, NPU_U8, NPU_U16, NPU_U32, NPU_U64, call)
 
-NIGHTLY = "/wrk/mllib_regr/jenkins/workspace/regression/AIELibs/mllib/nightly"
-TYPES = {"float": (NPU_F32, np.float32), "float16": (NPU_F16, np.uint16),
-         "bfloat16": (NPU_BF16, np.uint16), "int8": (NPU_I8, np.int8),
-         "uint8": (NPU_U8, np.uint8), "int16": (NPU_I16, np.int16),
-         "uint16": (NPU_U16, np.uint16), "int32": (NPU_I32, np.int32),
-         "uint32": (NPU_U32, np.uint32), "int64": (NPU_I64, np.int64),
-         "uint64": (NPU_U64, np.uint64)}
-
-
-def root():
-    if os.environ.get("NPU_EMU_AIESIM_ROOT"):
-        return os.environ["NPU_EMU_AIESIM_ROOT"]
-    builds = sorted((d for d in glob.glob(f"{NIGHTLY}/*") if os.path.basename(d).isdigit()),
-                    key=lambda d: int(os.path.basename(d)), reverse=True)
-    # The newest build may still be running; take the newest one with outputs.
-    for b in builds:
-        w = f"{b}/Vitis_Libraries/mllib/L2/regression/wrapper"
-        if glob.glob(f"{w}/*_wrapper/*/XDNA_*/data/ofm32.txt"):
-            return w
-    return None
-
-
-def stream(path, dtype):
-    with open(path) as f:
-        words = [int(line, 16) for line in f if line.strip()]
-    return np.array(words, np.uint32).view(np.uint8).view(dtype)
-
-
-def words(case, name="coeff32.txt"):
-    return stream(os.path.join(case, "data", name), np.uint32)
-
-
-def fword(case, i, name="coeff32.txt"):
-    return float(words(case, name)[i:i + 1].view(np.float32)[0])
-
-
-def ty(t):
-    return TYPES[t]
+from aiesim_common import ROOT, cases as _cases, fword, stream, ty, words  # noqa: E402
 
 
 # Each runner returns (output bytes, expected bytes).
@@ -173,29 +136,13 @@ WRAPPERS = ["convert_fp32_fp16", "convert_fp16_fp32", "convert_fp16_bf16", "conv
             "requantize_a16_channelwise", "cast_int32_int64"]
 
 
-ROOT = root()
-
-
-def cases():
-    r = ROOT
-    out = []
-    if r is None:
-        return out
-    for w in WRAPPERS:
-        for c in sorted(glob.glob(f"{r}/{w}_wrapper/*/XDNA_*")):
-            if os.path.exists(f"{c}/data/ofm32.txt") and os.path.exists(f"{c}/testcase.json"):
-                out.append(pytest.param(w, c, id=re.sub(r"^XDNA_|_AIE_Test.*$", "",
-                                                        os.path.basename(c))))
-    return out
-
-
-CASES = cases()
+CASES = _cases([f"{w}_wrapper" for w in WRAPPERS])
 
 
 @pytest.mark.skipif(not CASES, reason="no mllib regression outputs reachable")
 @pytest.mark.parametrize("wrapper,case", CASES)
 def test_aiesim(wrapper, case):
-    got, want = run(case, wrapper)
+    got, want = run(case, wrapper.removesuffix("_wrapper"))
     bad = np.nonzero(got != want)[0]
     assert bad.size == 0, (f"{bad.size}/{want.size} bytes differ from aiesim, first at "
                            f"{bad[:8].tolist()}: got {got[bad[:8]].tolist()} "

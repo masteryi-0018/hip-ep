@@ -162,6 +162,16 @@ def fp8_to_f32(c):
     return np.where(c & 0x80, -v, v).astype(np.float32)
 
 
+def fp8_to_f32_row(c):
+    """fp8 decode as the AIE4 kernels do it (identity mul_8x8_8x8): a NaN makes
+    its whole group of 8 consecutive elements (from the buffer start) NaN."""
+    v = fp8_to_f32(c)
+    n = len(v)
+    pad = np.concatenate([v, np.zeros((-n) % 8, np.float32)]).reshape(-1, 8)
+    pad = np.where(np.isnan(pad).any(axis=1, keepdims=True), np.float32(np.nan), pad)
+    return pad.reshape(-1)[:n]
+
+
 def load_float(bits, t):
     return {"f32": lambda b: np.asarray(b, np.float32), "f16": f16_bits_to_f32,
             "bf16": bf16_bits_to_f32}[t](bits)
@@ -327,7 +337,7 @@ def fp16_fp8(bits, in_t, scale):
 
 
 def fp8_to(c, scale, out_t):
-    v = fp8_to_f32(c) * np.float32(scale)
+    v = fp8_to_f32_row(c) * np.float32(scale)
     return store_float(v, out_t, AWAY if out_t != "f32" else EVEN)
 
 

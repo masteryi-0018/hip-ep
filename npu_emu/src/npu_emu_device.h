@@ -179,6 +179,18 @@ __device__ inline float fp8_to_f32(uint8_t c) {
   return neg ? -v : v;
 }
 
+// fp8 element i of a buffer as the AIE4 kernels decode it: mul_8x8_8x8 against
+// an 8x8 identity matrix, i.e. each group of 8 consecutive elements (aligned to
+// the buffer start) is a matrix row and every output sums its row's 8 products.
+// NaN * 0 is NaN, so a NaN anywhere in the row makes all 8 outputs NaN. Checked
+// on aiesim outputs of the fp8 compare and convert kernels.
+__device__ inline float fp8_to_f32_row(const uint8_t* p, int64_t i, int64_t n) {
+  const int64_t r = i & ~int64_t(7);
+  for (int64_t k = r; k < r + 8 && k < n; ++k)
+    if ((p[k] & 0x7f) == 0x7f) return __uint_as_float(0x7fc00000u);
+  return fp8_to_f32(p[i]);
+}
+
 // Floating point element of type t (F32 / F16 / BF16) as fp32 (exact).
 __device__ inline float load_float(const void* p, npu_dtype t, int64_t i) {
   switch (t) {
@@ -290,6 +302,25 @@ __device__ inline int64_t requant_tail(float v, npu_dtype t) {
   int64_t lo, hi;
   int_range(t, &lo, &hi);
   return sat_rne(v, lo, hi);
+}
+
+// The AIE4 tile rounding modes used when a kernel converts fp32 to an integer
+// (to_vector_sign / to_fixed): conv_even = nearest, ties to even;
+// symmetric_floor = toward zero.
+enum IntRnd { kIntEven = 0, kIntTrunc = 1 };
+
+// to_vector_sign<t>(acc, shift) / to_fixed(v, shift) for 8/16/32-bit integer t:
+// v * 2^shift (exact), rounded with `mode`, saturated to the range of t.
+// NaN -> 0 (unverified on the NPU).
+__device__ inline int64_t to_int_sat(float v, npu_dtype t, int shift, IntRnd mode) {
+  int64_t lo, hi;
+  int_range(t, &lo, &hi);
+  if (v != v) return 0;
+  const double x = ldexp(double(v), shift);
+  const double r = mode == kIntEven ? rint(x) : trunc(x);
+  if (r <= double(lo)) return lo;
+  if (r >= double(hi)) return hi;
+  return int64_t(r);
 }
 
 // ---- block floating point (mllib DataConverter.f2bfp_mladf, non-bfloat) ----

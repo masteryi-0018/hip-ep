@@ -11,15 +11,15 @@ PYTHON ?= python3
 BUILD_DIR ?= out
 
 LIB := $(BUILD_DIR)/libnpu_emu.so
-SRCS := src/npu_emu.hip
-HDRS := include/npu_emu.h src/npu_emu_device.h
+SRCS := $(wildcard src/*.hip)
+HDRS := $(wildcard include/*.h src/*.h)
 
 .PHONY: all test clean
 all: $(LIB)
 
 $(LIB): $(SRCS) $(HDRS)
 	@mkdir -p $(BUILD_DIR)
-	$(HIPCC) -std=c++17 -O2 -fPIC -shared --offload-arch=$(ARCH) -Iinclude -o $@ $(SRCS)
+	$(HIPCC) -std=c++17 -O2 -fPIC -shared --offload-arch=$(ARCH) -Iinclude -Isrc -o $@ $(SRCS)
 
 test: $(LIB)
 	NPU_EMU_LIB=$(abspath $(LIB)) $(PYTHON) -m pytest tests -q -p no:cacheprovider $(if $(K),-k "$(K)")

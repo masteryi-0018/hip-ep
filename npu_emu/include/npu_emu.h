@@ -20,7 +20,9 @@
  *     little-endian 96-bit word: bits 0-7 shared exponent, bits 8-15 one shift
  *     bit per pair of values, bits 16+5k..20+5k the 5-bit sign-magnitude
  *     mantissa of value k; value = +-mag * 2^(e - shift - 130).
- *   - fp8 is E4M3FN (bias 7, no infinity, 0x7F / 0xFF are NaN).
+ *   - fp8 is E4M3FN (bias 7, no infinity, 0x7F / 0xFF are NaN). The kernels
+ *     decode fp8 by an 8x8 identity matrix multiply, so a NaN makes all 8
+ *     values of its group (8 consecutive elements from the buffer start) NaN.
  *
  * All pointers are device pointers; n counts elements. Functions are
  * asynchronous on `stream` (a hipStream_t, may be null) and return a
@@ -175,5 +177,10 @@ int npu_cast_bfp16toqdqf32(void* stream, const void* in, void* out, int64_t n,
 #ifdef __cplusplus
 }
 #endif
+
+/* Data-movement / selection wrappers. */
+#include "npu_emu_movement.h"
+#include "npu_emu_select.h"
+#include "npu_emu_qdq.h"
 
 #endif  // NPU_EMU_H_
