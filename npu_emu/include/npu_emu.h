@@ -186,6 +186,9 @@ int npu_cast_bfp16toqdqf32(void* stream, const void* in, void* out, int64_t n,
 /* QDQ integer matrix-multiply / convolution wrappers. */
 #include "npu_emu_matmul.h"
 
+/* xint8 (power-of-two scale) convolution, depthwise and conv + add wrappers. */
+#include "npu_emu_xint8_conv.h"
+
 /* Elementwise arithmetic: integer / qdq add, sub, mul, mac (npu_emu_arith_int.h),
  * integer division, prelu / leaky relu / square and qdq batchnorm
  * (npu_emu_arith_misc.h), and the bf16 / f16 / fp8 / bfp16 ones
