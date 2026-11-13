@@ -194,4 +194,11 @@ int npu_cast_bfp16toqdqf32(void* stream, const void* in, void* out, int64_t n,
 #include "npu_emu_arith_misc.h"
 #include "npu_emu_arith_float.h"
 
+/* Interpolation / sampling / position encoding: bilinear grid sample
+ * (npu_emu_gridsample.h), bilinear / cubic resize (npu_emu_resize.h) and RoPE
+ * (npu_emu_rope.h). */
+#include "npu_emu_gridsample.h"
+#include "npu_emu_resize.h"
+#include "npu_emu_rope.h"
+
 #endif  // NPU_EMU_H_
