@@ -1,0 +1,182 @@
+# Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# Licensed under the MIT License.
+"""Integer / QDQ arithmetic entry points against NPU reference outputs, byte for byte."""
+
+import numpy as np
+import pytest
+
+from fixture import assert_bytes, cases, data, ofm, rtp_words, tensor_descr, ty, words
+from fixture import testcase as load
+from npu import I64, OUT, Host
+from testing import call_n
+
+FLAT = ["qdq_elementwise_add_a8_wrapper", "qdq_elementwise_add_a16_wrapper",
+        "qdq_elementwise_sub_a8_wrapper", "qdq_elementwise_sub_a16_wrapper",
+        "qdq_elementwise_mul_a8_wrapper", "qdq_elementwise_mul_a16_wrapper"]
+FLAT_FUSED = ["qdq_elementwise_add_fused_a8_wrapper", "qdq_elementwise_add_fused_a16_wrapper",
+              "qdq_elementwise_sub_fused_a8_wrapper", "qdq_elementwise_sub_fused_a16_wrapper",
+              "qdq_elementwise_mul_fused_a8_wrapper", "qdq_elementwise_mul_fused_a16_wrapper"]
+XINT = ["xint8_add_wrapper", "elementwise_add_fused_a8_xint_wrapper", "xint8_mac_wrapper"]
+BC3D = [f"qdq_elementwise_broadcasting3d_{op}_a{b}_wrapper" for op in ("add", "sub", "mul")
+        for b in (8, 16)]
+BC3D_FUSED = [f"qdq_elementwise_broadcasting3d_{op}_fused_a{b}_wrapper"
+              for op in ("add", "sub", "mul") for b in (8, 16)]
+MAC_FUSED = [f"qdq_elementwise_broadcasting3d_mac_fused_{v}_wrapper"
+             for v in ("a8w8", "a16w8", "a16w16")]
+
+ACT_PRELU = 9
+
+
+def fwords(w):
+    return [float(x) for x in np.asarray(w, np.uint32).view(np.float32)]
+
+
+def int_type(bits, signed):
+    return f"{'' if signed else 'u'}int{bits}"
+
+
+def bits_of(t):
+    return 8 if t.endswith("int8") else 16
+
+
+def shp(s):
+    return Host(np.array(s, np.int64))
+
+
+def valid(t, k):
+    return tuple(t[f"{k}_valid_full_{d}"] for d in ("height", "width", "channel"))
+
+
+def volume(case, t, k, fname, dtype):
+    """A logical HWC input cropped from its physical full volume."""
+    it = [t[f"ifm1_{d}_iteration"] for d in ("height", "width", "channel")]
+    ps = [t[f"{k}_physical_sv_{d}"] for d in ("height", "width", "channel")]
+    vs = valid(t, k)
+    if k == "ifm1":
+        phys = [p * i for p, i in zip(ps, it)]
+    else:
+        phys = [p * i if v > 1 else p for p, i, v in zip(ps, it, vs)]
+    flat = data(case, fname, ty(dtype)[1])
+    return np.ascontiguousarray(flat[:np.prod(phys)].reshape(phys)[:vs[0], :vs[1], :vs[2]])
+
+
+def check_hwc(case, got, dtype):
+    vshape, pshape, _ = tensor_descr(case)
+    want = data(case, ofm(case), ty(dtype)[1])[:np.prod(pshape)].reshape(pshape)
+    assert_bytes(got.reshape(vshape), want[:vshape[0], :vshape[1], :vshape[2]])
+
+
+def check_flat(case, got, dtype):
+    want = data(case, ofm(case), ty(dtype)[1])[:got.size]
+    assert_bytes(got, want)
+
+
+@pytest.mark.parametrize("d,case", cases(FLAT))
+def test_flat(d, case):
+    t = load(case)
+    n = t["ifm_sv_size"] * t["ifm_sv_iteration"]
+    it, ot = t["ifm_dtype"], t["ofm_dtype"]
+    a = data(case, "ifm32.txt", ty(it)[1])[:n]
+    b = data(case, "wts32.txt", ty(it)[1])[:n]
+    mul = "_mul_" in d
+    c = fwords(rtp_words(case)[2:6 if mul else 5])  # after the two loop-count words
+    name = f"npu_elementwise_{'mul' if mul else 'add'}_a{bits_of(it)}"
+    got = call_n(name, a, ty(it)[0], b, OUT, ty(ot)[0], I64(n), *c, n=n, dt=ty(ot)[1])
+    check_flat(case, got, ot)
+
+
+@pytest.mark.parametrize("d,case", cases(FLAT_FUSED))
+def test_flat_fused(d, case):
+    t = load(case)
+    n = t["ifm_sv_size"] * t["ifm_sv_iteration"]
+    it, ot = t["ifm_dtype"], t["ofm_dtype"]
+    a = data(case, "ifm32.txt", ty(it)[1])[:n]
+    b = data(case, "wts32.txt", ty(it)[1])[:n]
+    mul = "_mul_" in d
+    nc = 4 if mul else 3  # coefficients, then the two activation words
+    w = fwords(words(case)[:nc + 2])
+    op = "mul" if mul else ("sub" if "_sub_" in d else "add")
+    got = call_n(f"npu_elementwise_{op}_fused_a{bits_of(it)}", a, ty(it)[0], b, OUT, ty(ot)[0],
+                 I64(n), *w[:nc], int(t["activation_type"]), w[nc], w[nc + 1], n=n,
+                 dt=ty(ot)[1])
+    check_flat(case, got, ot)
+
+
+@pytest.mark.parametrize("d,case", cases(XINT))
+def test_xint(d, case):
+    t = load(case)
+    if d == "xint8_mac_wrapper":
+        x1 = volume(case, t, "ifm1", "ifm32.txt", int_type(8, t["signed_ifm1"]))
+        x2 = volume(case, t, "ifm2", "wts32.txt", int_type(8, t["signed_ifm2"]))
+        x3 = volume(case, t, "ifm3", "ifm2_32.txt", int_type(8, t["signed_ifm3"]))
+        A, v, p, tt = (int(x) for x in words(case)[:4].view(np.int32))
+        ot = int_type(8, t["signed_ofm"])
+        got = call_n("npu_elementwise_mac_a8", x1, ty(int_type(8, t["signed_ifm1"]))[0], x2,
+                     ty(int_type(8, t["signed_ifm2"]))[0], x3, ty(int_type(8, t["signed_ifm3"]))[0],
+                     OUT, ty(ot)[0], shp(x1.shape), shp(x2.shape), shp(x3.shape), A, v, p, tt,
+                     n=x1.size, dt=ty(ot)[1])
+        check_hwc(case, got, ot)
+        return
+    n = t["ifm_sv_size"] * t["ifm_sv_iteration"]
+    a = data(case, "ifm32.txt", np.int8)[:n]
+    b = data(case, "wts32.txt", np.int8)[:n]
+    w = fwords(words(case)[:5])
+    if d == "xint8_add_wrapper":
+        got = call_n("npu_elementwise_add_a8_xint", a, b, OUT, I64(n), *w[:3], n=n, dt=np.int8)
+    else:
+        got = call_n("npu_elementwise_add_fused_a8_xint", a, b, OUT, I64(n), w[0], w[1],
+                     int(t["activation_type"]), w[3], w[4], n=n, dt=np.int8)
+    check_flat(case, got, "int8")
+
+
+@pytest.mark.parametrize("d,case", cases(BC3D))
+def test_bc3d(d, case):
+    t = load(case)
+    # the output takes the input type
+    assert bool(t["signed_ifm"]) == bool(t["signed_ofm"])
+    dt = int_type(bits_of(t["dtype"]), t["signed_ifm"])
+    a = volume(case, t, "ifm1", "ifm32.txt", dt)
+    b = volume(case, t, "ifm2", "wts32.txt", dt)
+    mul = "_mul_" in d
+    c = fwords(words(case)[:4 if mul else 3])
+    got = call_n(f"npu_qdq_elementwise_broadcasting3d_{'mul' if mul else 'add'}_a{bits_of(dt)}", a,
+                 ty(dt)[0], b, OUT, shp(a.shape), shp(b.shape), *c, n=a.size, dt=ty(dt)[1])
+    check_hwc(case, got, dt)
+
+
+@pytest.mark.parametrize("d,case", cases(BC3D_FUSED))
+def test_bc3d_fused(d, case):
+    t = load(case)
+    dt = t["dtype"]
+    a = volume(case, t, "ifm1", "ifm32.txt", dt)
+    b = volume(case, t, "ifm2", "wts32.txt", dt)
+    act = int(t["activation_type"])
+    w = words(case)
+    mul = "_mul_" in d
+    slope = None
+    if act == ACT_PRELU:
+        # per channel block: a 32-word header, then the block's slopes
+        sv = t["ifm1_physical_sv_channel"]
+        blocks = w[:(32 + sv) * t["ifm1_channel_iteration"]].reshape(-1, 32 + sv)
+        slope = np.ascontiguousarray(blocks[:, 32:].reshape(-1)[:a.shape[2]]).view(np.float32)
+    k = Host(np.ascontiguousarray(w[:9 if mul else 8]))
+    op = "mul" if mul else ("sub" if "_sub_" in d else "add")
+    got = call_n(f"npu_qdq_elementwise_broadcasting3d_{op}_fused_a{bits_of(dt)}", a, ty(dt)[0], b,
+                 OUT, shp(a.shape), shp(b.shape), k, act, slope, n=a.size, dt=ty(dt)[1])
+    check_hwc(case, got, dt)
+
+
+@pytest.mark.parametrize("d,case", cases(MAC_FUSED))
+def test_mac_fused(d, case):
+    t = load(case)
+    dt, wt, ct = t["dtype"], t["wts_dtype"], t["addend_dtype"]
+    a = volume(case, t, "ifm1", "ifm32.txt", dt)
+    b = volume(case, t, "ifm2", "wts32.txt", wt)
+    c = volume(case, t, "ifm3", "ifm2_32.txt", ct)
+    assert b.shape == c.shape
+    k = Host(np.ascontiguousarray(words(case)[:8]))
+    variant = d.split("mac_fused_")[1].split("_wrapper")[0]
+    got = call_n(f"npu_qdq_elementwise_broadcasting3d_mac_fused_{variant}", a, ty(dt)[0], b,
+                 ty(wt)[0], c, ty(ct)[0], OUT, shp(a.shape), shp(b.shape), k,
+                 int(t["activation_type"]), n=a.size, dt=ty(dt)[1])
+    check_hwc(case, got, dt)

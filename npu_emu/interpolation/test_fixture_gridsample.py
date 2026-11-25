@@ -1,0 +1,181 @@
+# Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# Licensed under the MIT License.
+"""gridsample.h entry points against NPU reference outputs, byte for byte."""
+
+import ctypes
+
+import numpy as np
+import pytest
+
+from fixture import HALF as FLOAT
+from fixture import INT, cases, data, ofm, words
+from fixture import testcase as tc
+from npu import I64, OUT, Host
+from npu import call as callx
+
+
+class GridQdq(ctypes.Structure):
+    _fields_ = [("grid_zp", ctypes.c_int32), ("grid_scale", ctypes.c_float),
+                ("ifm_zp", ctypes.c_int32), ("ifm_scale", ctypes.c_float),
+                ("ofm_zp", ctypes.c_int32), ("ofm_scale", ctypes.c_float)]
+
+
+def ifm_slices(case, t, dt, align):
+    """Per channel pair an [H][W][2] slice padded to `align` elements
+    -> [H][W][C]."""
+    H, W, ci = t["in_h"], t["in_w"], t["c_iteration"]
+    flat = data(case, "ifm32.txt", dt)
+    n, step = H * W * 2, -(-H * W * 2 // align) * align
+    return np.ascontiguousarray(np.concatenate(
+        [flat[k * step:k * step + n].reshape(H, W, 2) for k in range(ci)], axis=-1))
+
+
+def ofm_slices(case, t, dt, align):
+    """Per channel pair and width iteration an [Ho][sv_out_w][2] slice padded to
+    `align` elements -> [Ho][Wo][C]."""
+    Ho, Wo, C = t["out_h"], t["out_w"], t["in_c"]
+    sw, wi, ci = t["sv_out_w"], t["w_iteration"], t["c_iteration"]
+    flat = data(case, ofm(case), dt)
+    n = Ho * sw * 2
+    step = -(-n // align) * align
+    out = np.empty((Ho, Wo, C), dt)
+    pos = 0
+    for c in range(ci):
+        for w in range(wi):
+            out[:, w * sw:(w + 1) * sw, 2 * c:2 * c + 2] = flat[pos:pos + n].reshape(Ho, sw, 2)
+            pos += step
+    return out
+
+
+def ofm_hwc(case, t, dt):
+    Ho, Wo, C = t["out_h"], t["out_w"], t["in_c"]
+    return data(case, ofm(case), dt)[:Ho * Wo * C].reshape(Ho, Wo, C)
+
+
+def grid_u16(case, t):
+    Ho, Wo = t["out_h"], t["out_w"]
+    return np.ascontiguousarray(data(case, "wts32.txt", np.uint16)[:Ho * Wo * 2].reshape(Ho, Wo, 2))
+
+
+def qdq_coeff(case):
+    w = words(case)
+    return tuple(int(w[k:k + 1].view(np.int32)[0]) if k % 2 == 0 else
+                 float(w[k:k + 1].view(np.float32)[0]) for k in range(6))
+
+
+# Each loader returns (entry point, args before OUT, args after OUT, qdq
+# coefficients, reference-model call, want).
+
+def load_bf16(case, t):
+    nt, tn = FLOAT[t["ifm_dtype"]]
+    x = ifm_slices(case, t, np.uint16, 32)
+    grid = grid_u16(case, t)
+    want = ofm_hwc(case, t, np.uint16)
+    return ("npu_gridsample_bf16", (x, nt, grid), (), (),
+            lambda gs: gs.gridsample_bf16(x, grid, tn), want)
+
+
+def load_fp8(case, t):
+    nt, tn = FLOAT[t["wts_dtype"]]
+    x = ifm_slices(case, t, np.uint8, 64)
+    grid = grid_u16(case, t)
+    s_in, ofm_scale = (float(v) for v in words(case)[:2].view(np.float32))
+    want = ofm_slices(case, t, np.uint8, 64)
+    return ("npu_gridsample_fp8", (x, grid, nt), (s_in, ofm_scale), (),
+            lambda gs: gs.gridsample_fp8(x, grid, tn, s_in, ofm_scale), want)
+
+
+def load_qdq(case, t, a16):
+    nt, dt, tn = INT[t["ifm_dtype"]]
+    x = ifm_slices(case, t, dt, 32 if a16 else 64)
+    grid = grid_u16(case, t)
+    q = qdq_coeff(case)
+    al = t["align_corners"]
+    want = ofm_hwc(case, t, dt) if a16 else ofm_slices(case, t, dt, 1)
+    ct = FLOAT[t.get("compute_dtype", "bfloat16")] if a16 else FLOAT["bfloat16"]
+    name = "npu_qdq_gridsample_a16" if a16 else "npu_qdq_gridsample_a8"
+    tail = (al, ct[0]) if a16 else (al,)
+    return (name, (x, nt, grid), tail, q,
+            (lambda gs: gs.qdq_gridsample_a16(x, grid, al, q, ct[1], tn)) if a16
+            else (lambda gs: gs.qdq_gridsample_a8(x, grid, al, q, tn)), want)
+
+
+LOADERS = {"gridsample_bf16_wrapper": load_bf16, "gridsample_fp8_wrapper": load_fp8,
+           "qdq_gridsample_a16_wrapper": lambda c, t: load_qdq(c, t, True),
+           "qdq_gridsample_a8_wrapper": lambda c, t: load_qdq(c, t, False)}
+
+CASES = cases(list(LOADERS))
+
+
+def load(wrapper, case):
+    t = tc(case)
+    return t, LOADERS[wrapper](case, t)
+
+
+@pytest.mark.skipif(not CASES, reason="no fixture cases")
+@pytest.mark.parametrize("wrapper,case", CASES)
+def test_fixture_gridsample(wrapper, case):
+    t, (name, pre, post, q, _, want) = load(wrapper, case)
+    H, W, C, Ho, Wo = t["in_h"], t["in_w"], t["in_c"], t["out_h"], t["out_w"]
+    args = list(pre) + [OUT, I64(H), I64(W), I64(C), I64(Ho), I64(Wo)] + list(post)
+    if q:
+        args.append(Host(ctypes.byref(GridQdq(*q))))
+    got = callx(name, *args, out_nbytes=want.nbytes, out_dtype=want.dtype)
+    got, want = got.reshape(-1), want.reshape(-1)
+    bad = np.nonzero(got != want)[0]
+    assert bad.size == 0, (f"{bad.size}/{want.size} elements differ from sim, first at "
+                           f"{bad[:8].tolist()}: got {got[bad[:8]].tolist()} "
+                           f"want {want[bad[:8]].tolist()}")
+
+
+# ---- grid from an int8 flow, fused with its ReduceL2 ----
+
+FLOW_FIELDS = ("ka", "mq_x", "msh_x", "mq_y", "msh_y", "shift", "ax", "bx", "ay", "by",
+               "norm_mode", "n_mq", "n_msh", "out_shift", "p_mq", "p_msh", "p_am", "p_ac",
+               "p_ash")
+# coeff block words: 6 qdq words, then magic and these header fields
+HEADER = ("ka", "mq_x", "msh_x", "mq_y", "msh_y", "shift", "ax", "bx", "ay", "by", "norm_mode",
+          "n_mq", "n_msh", "out_shift", "grid_bytes", "f_up", "tx_off", "ty_off", "pre",
+          "p_mq", "p_msh", "p_am", "p_ac", "p_ash")
+
+
+class GridFlow(ctypes.Structure):
+    _fields_ = [(k, ctypes.c_int32) for k in FLOW_FIELDS]
+
+
+FLOW_DIRS = {"qdq_Gridsample_ReduceL2_Fused_a8_wrapper": False,
+             "qdq_Resize_Gridsample_ReduceL2_Fused_a8_wrapper": True}
+FLOW_CASES = cases(list(FLOW_DIRS))
+
+
+@pytest.mark.skipif(not FLOW_CASES, reason="no fixture cases")
+@pytest.mark.parametrize("wrapper,case", FLOW_CASES)
+def test_fixture_gridsample_reducel2_fused(wrapper, case):
+    t = tc(case)
+    H, W, Ho, Wo = t["in_h"], t["in_w"], t["out_h"], t["out_w"]
+    w = words(case)
+    h = dict(zip(HEADER, w[7:7 + len(HEADER)].view(np.int32).tolist()))
+    raw = w.view(np.int8)
+    # tx: 32 bytes per 4 columns (their 4 codes repeated); ty: each code repeated 4 times
+    tx = np.ascontiguousarray(raw[h["tx_off"]:h["tx_off"] + 8 * Wo].reshape(-1, 32)[:, :4]
+                              .reshape(-1))
+    ty = np.ascontiguousarray(raw[h["ty_off"]:h["ty_off"] + 4 * Ho:4])
+    up = h["f_up"]
+    fs = (Ho // 2, Wo // 2, 4) if up else (Ho, Wo, 4)
+    n = fs[0] * fs[1] * 4
+    x = data(case, "ifm32.txt", np.int8)[:H * W * 4]
+    flows = [data(case, "wts32.txt", np.int8)[:n]]
+    if FLOW_DIRS[wrapper]:
+        flows.append(data(case, "ifm2_32.txt", np.int8)[:n])
+    name = ("npu_qdq_Resize_Gridsample_ReduceL2_Fused_a8" if FLOW_DIRS[wrapper]
+            else "npu_qdq_Gridsample_ReduceL2_Fused_a8")
+    q = qdq_coeff(case)
+    got = callx(name, x, *flows, tx, ty, OUT, I64(H), I64(W), I64(Ho), I64(Wo),
+                t["padding_mode"], up, Host(ctypes.byref(GridQdq(*q))),
+                Host(ctypes.byref(GridFlow(*(h[k] for k in FLOW_FIELDS)))),
+                out_nbytes=Ho * Wo * 8, out_dtype=np.int8)
+    want = data(case, ofm(case), np.int8)[:Ho * Wo * 8]
+    bad = np.nonzero(got != want)[0]
+    assert bad.size == 0, (f"{bad.size}/{want.size} bytes differ from sim, first at "
+                           f"{bad[:8].tolist()}: got {got[bad[:8]].tolist()} "
+                           f"want {want[bad[:8]].tolist()}")
